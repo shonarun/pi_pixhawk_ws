@@ -12,6 +12,17 @@ def generate_launch_description():
         launch_arguments={'fcu_url': 'serial:///dev/ttyUSB0:921600'}.items()
     )
 
+    set_stream_rate = ExecuteProcess(
+        cmd=[
+            'ros2', 'service', 'call', '/mavros/set_stream_rate',
+            'mavros_msgs/srv/StreamRate',
+            '{stream_id: 0, message_rate: 20, on_off: true}'
+        ],
+        shell=True,
+        output='screen'
+    )
+
     return LaunchDescription([
-        mavros_launch
+        mavros_launch,
+        set_stream_rate
     ])
