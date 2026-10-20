@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'state_monitor = airmouse_control.state_monitor:main',
         ],
     },
 )
