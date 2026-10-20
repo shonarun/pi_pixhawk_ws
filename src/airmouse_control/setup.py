@@ -27,6 +27,7 @@ setup(
             'state_monitor = airmouse_control.state_monitor:main',
             'arm_test = airmouse_control.arm_test:main',
             'takeoff_land = airmouse_control.takeoff_land:main',
+            'square_mission = airmouse_control.square_mission:main',
         ],
     },
 )
