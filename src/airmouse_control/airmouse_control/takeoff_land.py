@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float64
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL, StreamRate
 
@@ -32,8 +33,9 @@ class TakeoffLand(Node):
 
         self.current_state = State()
         self.current_z = 0.0
+        self.takeoff_z = 0.0
         self.pose_received = False
-        self.stream_set = False
+        self.stream_requested = False
         self.target_alt = 2.0
         self.step = 0
         self.hover_ticks = 0
@@ -54,16 +56,14 @@ class TakeoffLand(Node):
         if not self.current_state.connected:
             return
 
-        if not self.stream_set:
-            if self.stream_cli.service_is_ready():
-                req = StreamRate.Request()
-                req.stream_id = 0
-                req.message_rate = 20
-                req.on_off = True
-                self.stream_cli.call_async(req)
-                self.stream_set = True
-                self.get_logger().info('Stream rate 20Hz requested.')
-            return
+        if not self.stream_requested and self.stream_cli.service_is_ready():
+            req = StreamRate.Request()
+            req.stream_id = 0
+            req.message_rate = 20
+            req.on_off = True
+            self.stream_cli.call_async(req)
+            self.stream_requested = True
+            self.get_logger().info('Stream rate 20Hz requested.')
 
         if self.step == 0:
             if self.current_state.mode != 'GUIDED':
@@ -80,7 +80,6 @@ class TakeoffLand(Node):
             if not self.current_state.armed:
                 if not self.arm_cli.service_is_ready():
                     return
-                self.get_logger().info('Sending arm command...')
                 req = CommandBool.Request()
                 req.value = True
                 self.arm_cli.call_async(req)
@@ -90,11 +89,10 @@ class TakeoffLand(Node):
 
         elif self.step == 2:
             if not self.pose_received:
-                self.get_logger().warn('Armed, but /mavros/local_position/pose is still empty...')
                 return
             if not self.takeoff_cli.service_is_ready():
                 return
-            self.get_logger().info('Requesting takeoff...')
+            self.takeoff_z = self.current_z
             req = CommandTOL.Request()
             req.altitude = self.target_alt
             future = self.takeoff_cli.call_async(req)
@@ -102,8 +100,9 @@ class TakeoffLand(Node):
             self.step = 3
 
         elif self.step == 3:
-            self.get_logger().info(f'Climbing... Current Z: {self.current_z:.2f}m')
-            if self.current_z >= self.target_alt * 0.90:
+            relative_alt = self.current_z - self.takeoff_z
+            self.get_logger().info(f'Climbing... Relative Alt: {relative_alt:.2f}m (Z: {self.current_z:.2f})')
+            if relative_alt >= self.target_alt * 0.90:
                 self.get_logger().info('Target altitude reached. Hovering for 5 seconds...')
                 self.step = 4
 

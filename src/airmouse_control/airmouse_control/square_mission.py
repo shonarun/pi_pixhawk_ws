@@ -46,6 +46,7 @@ class SquareMission(Node):
         self.current_state = State()
         self.current_pose = PoseStamped()
         self.current_z = 0.0
+        self.takeoff_z = 0.0
         self.pose_received = False
         self.stream_requested = False
 
@@ -134,6 +135,7 @@ class SquareMission(Node):
 
         elif self.step == 2:
             if self.takeoff_cli.service_is_ready() and self.throttle_ready(1.0):
+                self.takeoff_z = self.current_z
                 req = CommandTOL.Request()
                 req.altitude = self.target_alt
                 future = self.takeoff_cli.call_async(req)
@@ -141,7 +143,9 @@ class SquareMission(Node):
                 self.step = 3
 
         elif self.step == 3:
-            if self.current_z >= self.target_alt * 0.90:
+            relative_alt = self.current_z - self.takeoff_z
+            self.get_logger().info(f'Climbing... Relative Alt: {relative_alt:.2f}m (Z: {self.current_z:.2f})')
+            if relative_alt >= self.target_alt * 0.90:
                 if not self.pose_received:
                     if self.throttle_ready(1.0):
                         self.get_logger().warn(
