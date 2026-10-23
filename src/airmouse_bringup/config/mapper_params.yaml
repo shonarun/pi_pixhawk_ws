@@ -1,0 +1,11 @@
+slam_toolbox:
+  ros__parameters:
+    solver_plugin: solver_plugins::CeresSolver
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    mode: mapping
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.174
+    map_update_interval: 2.0
