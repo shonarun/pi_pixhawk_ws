@@ -2,6 +2,9 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
+    pkg_share = get_package_share_directory('airmouse_bringup')
+    slam_params_file = os.path.join(pkg_share, 'config', 'mapper_params.yaml')
+
     rplidar_node = Node(
         package='rplidar_ros',
         executable='rplidar_node',
@@ -44,8 +47,17 @@ def generate_launch_description():
         }]
     )
 
+   slam_toolbox_node = Node(
+        package='slam_toolbox',
+        executable='async_slam_toolbox_node',
+        name='slam_toolbox',
+        output='screen',
+        parameters=[slam_params_file]
+    )
+
     return LaunchDescription([
         rplidar_node,
         static_tf_node,
-        rf2o_node
+        rf2o_node,
+        slam_toolbox_node
     ])
