@@ -3,7 +3,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import State
-from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
+from mavros_msgs.srv import CommandBool, SetMode, CommandTOL, StreamRate
 
 
 class TakeoffLand(Node):
@@ -25,6 +25,7 @@ class TakeoffLand(Node):
             qos
         )
 
+        self.stream_cli = self.create_client(StreamRate, '/mavros/set_stream_rate')
         self.mode_cli = self.create_client(SetMode, '/mavros/set_mode')
         self.arm_cli = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.takeoff_cli = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
@@ -32,22 +33,36 @@ class TakeoffLand(Node):
         self.current_state = State()
         self.current_z = 0.0
         self.pose_received = False
+        self.stream_set = False
         self.target_alt = 2.0
         self.step = 0
         self.hover_ticks = 0
 
         self.timer = self.create_timer(1.0, self.fsm_step)
-        self.get_logger().info('TakeoffLand initialized. Waiting for FCU and GPS lock...')
+        self.get_logger().info('TakeoffLand initialized. Waiting for FCU connection...')
 
     def state_cb(self, msg: State):
         self.current_state = msg
 
     def pose_cb(self, msg: PoseStamped):
+        if not self.pose_received:
+            self.get_logger().info('Local position stream detected!')
         self.pose_received = True
         self.current_z = msg.pose.position.z
 
     def fsm_step(self):
-        if not self.current_state.connected or not self.pose_received:
+        if not self.current_state.connected:
+            return
+
+        if not self.stream_set:
+            if self.stream_cli.service_is_ready():
+                req = StreamRate.Request()
+                req.stream_id = 0
+                req.message_rate = 20
+                req.on_off = True
+                self.stream_cli.call_async(req)
+                self.stream_set = True
+                self.get_logger().info('Stream rate 20Hz requested.')
             return
 
         if self.step == 0:
@@ -65,16 +80,21 @@ class TakeoffLand(Node):
             if not self.current_state.armed:
                 if not self.arm_cli.service_is_ready():
                     return
+                self.get_logger().info('Sending arm command...')
                 req = CommandBool.Request()
                 req.value = True
                 self.arm_cli.call_async(req)
             else:
-                self.get_logger().info('Armed. Requesting takeoff...')
+                self.get_logger().info('Armed! Waiting for local position stream...')
                 self.step = 2
 
         elif self.step == 2:
+            if not self.pose_received:
+                self.get_logger().warn('Armed, but /mavros/local_position/pose is still empty...')
+                return
             if not self.takeoff_cli.service_is_ready():
                 return
+            self.get_logger().info('Requesting takeoff...')
             req = CommandTOL.Request()
             req.altitude = self.target_alt
             future = self.takeoff_cli.call_async(req)
