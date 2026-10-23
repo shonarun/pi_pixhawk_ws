@@ -1,56 +1,81 @@
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float64
 from mavros_msgs.msg import State
-from mavros_msgs.srv import CommandBool, SetMode, CommandTOL, StreamRate
+from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, StreamRate
 
 
 class TakeoffLand(Node):
     def __init__(self):
         super().__init__('takeoff_land')
 
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.cb_group = ReentrantCallbackGroup()
+
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
 
         self.state_sub = self.create_subscription(
             State,
             '/mavros/state',
             self.state_cb,
-            10
+            10,
+            callback_group=self.cb_group
         )
-        self.pose_sub = self.create_subscription(
+
+        self.local_pos_sub = self.create_subscription(
             PoseStamped,
             '/mavros/local_position/pose',
             self.pose_cb,
-            qos
+            sensor_qos,
+            callback_group=self.cb_group
         )
 
-        self.stream_cli = self.create_client(StreamRate, '/mavros/set_stream_rate')
-        self.mode_cli = self.create_client(SetMode, '/mavros/set_mode')
-        self.arm_cli = self.create_client(CommandBool, '/mavros/cmd/arming')
-        self.takeoff_cli = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
+        self.stream_cli = self.create_client(
+            StreamRate, '/mavros/set_stream_rate', callback_group=self.cb_group
+        )
+        self.mode_cli = self.create_client(
+            SetMode, '/mavros/set_mode', callback_group=self.cb_group
+        )
+        self.arm_cli = self.create_client(
+            CommandBool, '/mavros/cmd/arming', callback_group=self.cb_group
+        )
+        self.takeoff_cli = self.create_client(
+            CommandTOL, '/mavros/cmd/takeoff', callback_group=self.cb_group
+        )
 
         self.current_state = State()
-        self.current_z = 0.0
-        self.takeoff_z = 0.0
-        self.pose_received = False
+        self.relative_alt = 0.0
         self.stream_requested = False
+
         self.target_alt = 2.0
         self.step = 0
         self.hover_ticks = 0
+        self.last_req_time = self.get_clock().now()
+        self.takeoff_sent = False
 
-        self.timer = self.create_timer(1.0, self.fsm_step)
+        self.timer = self.create_timer(0.1, self.fsm_step, callback_group=self.cb_group)
         self.get_logger().info('TakeoffLand initialized. Waiting for FCU connection...')
 
     def state_cb(self, msg: State):
         self.current_state = msg
 
     def pose_cb(self, msg: PoseStamped):
-        if not self.pose_received:
-            self.get_logger().info('Local position stream detected!')
-        self.pose_received = True
-        self.current_z = msg.pose.position.z
+        self.relative_alt = msg.pose.position.z
+
+    def throttle_ready(self, seconds=1.0) -> bool:
+        now = self.get_clock().now()
+        # In rclpy, subtracting two Time objects yields a Duration, which has a nanoseconds attribute
+        if (now - self.last_req_time).nanoseconds >= seconds * 1e9:
+            self.last_req_time = now
+            return True
+        return False
 
     def fsm_step(self):
         if not self.current_state.connected:
@@ -67,57 +92,66 @@ class TakeoffLand(Node):
 
         if self.step == 0:
             if self.current_state.mode != 'GUIDED':
-                if not self.mode_cli.service_is_ready():
-                    return
-                req = SetMode.Request()
-                req.custom_mode = 'GUIDED'
-                self.mode_cli.call_async(req)
+                if self.mode_cli.service_is_ready() and self.throttle_ready(1.0):
+                    self.get_logger().info('Requesting GUIDED mode...')
+                    req = SetMode.Request()
+                    req.custom_mode = 'GUIDED'
+                    self.mode_cli.call_async(req)
             else:
                 self.get_logger().info('GUIDED mode confirmed.')
                 self.step = 1
 
         elif self.step == 1:
             if not self.current_state.armed:
-                if not self.arm_cli.service_is_ready():
-                    return
-                req = CommandBool.Request()
-                req.value = True
-                self.arm_cli.call_async(req)
+                if self.arm_cli.service_is_ready() and self.throttle_ready(1.0):
+                    self.get_logger().info('Requesting Arming...')
+                    req = CommandBool.Request()
+                    req.value = True
+                    self.arm_cli.call_async(req)
             else:
-                self.get_logger().info('Armed! Waiting for local position stream...')
+                self.get_logger().info('Armed! Ready for takeoff.')
+                self.takeoff_sent = False
                 self.step = 2
 
         elif self.step == 2:
-            if not self.pose_received:
-                return
-            if not self.takeoff_cli.service_is_ready():
-                return
-            self.takeoff_z = self.current_z
-            req = CommandTOL.Request()
-            req.altitude = self.target_alt
-            future = self.takeoff_cli.call_async(req)
-            future.add_done_callback(self.takeoff_response_cb)
-            self.step = 3
+            if not self.takeoff_sent and self.takeoff_cli.service_is_ready() and self.throttle_ready(1.0):
+                req = CommandTOL.Request()
+                req.min_pitch = 0.0
+                req.yaw = 0.0
+                req.latitude = 0.0
+                req.longitude = 0.0
+                req.altitude = float(self.target_alt)
+
+                future = self.takeoff_cli.call_async(req)
+                future.add_done_callback(self.takeoff_response_cb)
+                self.takeoff_sent = True
+                self.get_logger().info(f'Sent takeoff request to {self.target_alt}m...')
 
         elif self.step == 3:
-            relative_alt = self.current_z - self.takeoff_z
-            self.get_logger().info(f'Climbing... Relative Alt: {relative_alt:.2f}m (Z: {self.current_z:.2f})')
-            if relative_alt >= self.target_alt * 0.90:
+            if self.hover_ticks % 10 == 0:
+                self.get_logger().info(f'Climbing... Current Alt: {self.relative_alt:.2f}m')
+            self.hover_ticks += 1
+
+            if self.relative_alt >= self.target_alt * 0.90:
                 self.get_logger().info('Target altitude reached. Hovering for 5 seconds...')
+                self.hover_ticks = 0
                 self.step = 4
 
         elif self.step == 4:
             self.hover_ticks += 1
-            self.get_logger().info(f'Hovering... ({self.hover_ticks}/5)')
-            if self.hover_ticks >= 5:
+            if self.hover_ticks % 10 == 0:
+                self.get_logger().info(f'Hovering... ({self.hover_ticks // 10}/5s)')
+
+            if self.hover_ticks >= 50:
                 self.step = 5
 
         elif self.step == 5:
             if self.current_state.mode != 'LAND':
-                self.get_logger().info('Switching to LAND mode...')
-                req = SetMode.Request()
-                req.custom_mode = 'LAND'
-                self.mode_cli.call_async(req)
+                if self.mode_cli.service_is_ready() and self.throttle_ready(1.0):
+                    self.get_logger().info('Switching to LAND mode...')
+                    req = SetMode.Request()
+                    req.custom_mode = 'LAND'
+                    self.mode_cli.call_async(req)
             else:
                 self.get_logger().info('LAND mode active. Waiting for touchdown and disarm...')
                 self.step = 6
@@ -130,19 +164,26 @@ class TakeoffLand(Node):
     def takeoff_response_cb(self, future):
         try:
             res = future.result()
-            if not res.success:
-                self.get_logger().error('Takeoff rejected by FCU. Retrying...')
-                self.step = 2
+            if res.success:
+                self.get_logger().info('Takeoff accepted by FCU.')
+                self.hover_ticks = 0
+                self.step = 3
+            else:
+                self.get_logger().error('Takeoff rejected by FCU. Will retry...')
+                self.takeoff_sent = False
         except Exception as e:
-            self.get_logger().error(f'Takeoff call failed: {e}')
-            self.step = 2
+            self.get_logger().error(f'Takeoff service call failed: {e}')
+            self.takeoff_sent = False
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = TakeoffLand()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

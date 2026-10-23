@@ -1,18 +1,20 @@
-import math
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float64
-from mavros_msgs.msg import State
+from mavros_msgs.msg import State, Altitude
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL, StreamRate
 
 
-class SquareMission(Node):
+class TakeoffLand(Node):
     def __init__(self):
-        super().__init__('square_mission')
+        super().__init__('takeoff_land')
 
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
 
         self.state_sub = self.create_subscription(
             State,
@@ -24,18 +26,13 @@ class SquareMission(Node):
             PoseStamped,
             '/mavros/local_position/pose',
             self.pose_cb,
-            qos
+            sensor_qos
         )
         self.alt_sub = self.create_subscription(
-            Float64,
-            '/mavros/global_position/rel_alt',
+            Altitude,
+            '/mavros/altitude',
             self.alt_cb,
-            qos
-        )
-        self.setpoint_pub = self.create_publisher(
-            PoseStamped,
-            '/mavros/setpoint_position/local',
-            10
+            sensor_qos
         )
 
         self.stream_cli = self.create_client(StreamRate, '/mavros/set_stream_rate')
@@ -45,37 +42,29 @@ class SquareMission(Node):
 
         self.current_state = State()
         self.current_pose = PoseStamped()
-        self.current_z = 0.0
-        self.takeoff_z = 0.0
+        self.relative_alt = 0.0
         self.pose_received = False
         self.stream_requested = False
 
         self.target_alt = 2.0
-        self.side_length = 2.0
-        self.acceptance_radius = 0.25
-
-        self.home_x = 0.0
-        self.home_y = 0.0
-        self.waypoints = []
-        self.wp_index = 0
-        self.hold_ticks = 0
         self.step = 0
+        self.hover_ticks = 0
         self.last_req_time = self.get_clock().now()
 
         self.timer = self.create_timer(0.1, self.fsm_step)
-        self.get_logger().info('SquareMission initialized. Waiting for FCU connection...')
+        self.get_logger().info('TakeoffLand initialized. Waiting for FCU connection...')
 
     def state_cb(self, msg: State):
         self.current_state = msg
 
     def pose_cb(self, msg: PoseStamped):
+        if not self.pose_received:
+            self.get_logger().info('Local position stream detected.')
         self.pose_received = True
         self.current_pose = msg
-        self.current_z = msg.pose.position.z
 
-    def alt_cb(self, msg: Float64):
-        if not self.pose_received:
-            self.current_z = msg.data
+    def alt_cb(self, msg: Altitude):
+        self.relative_alt = msg.relative
 
     def throttle_ready(self, seconds=1.0):
         now = self.get_clock().now()
@@ -83,22 +72,6 @@ class SquareMission(Node):
             self.last_req_time = now
             return True
         return False
-
-    def publish_waypoint(self, x, y, z):
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
-        msg.pose.position.x = float(x)
-        msg.pose.position.y = float(y)
-        msg.pose.position.z = float(z)
-        msg.pose.orientation.w = 1.0
-        self.setpoint_pub.publish(msg)
-
-    def distance_to_target(self, tx, ty, tz):
-        px = self.current_pose.pose.position.x
-        py = self.current_pose.pose.position.y
-        pz = self.current_z
-        return math.sqrt((tx - px) ** 2 + (ty - py) ** 2 + (tz - pz) ** 2)
 
     def fsm_step(self):
         if not self.current_state.connected:
@@ -111,7 +84,7 @@ class SquareMission(Node):
             req.on_off = True
             self.stream_cli.call_async(req)
             self.stream_requested = True
-            self.get_logger().info('Stream rate 20Hz requested from FCU.')
+            self.get_logger().info('Stream rate 20Hz requested.')
 
         if self.step == 0:
             if self.current_state.mode != 'GUIDED':
@@ -130,63 +103,38 @@ class SquareMission(Node):
                     req.value = True
                     self.arm_cli.call_async(req)
             else:
-                self.get_logger().info('Armed. Requesting takeoff...')
+                self.get_logger().info('Armed! Requesting takeoff...')
                 self.step = 2
 
         elif self.step == 2:
             if self.takeoff_cli.service_is_ready() and self.throttle_ready(1.0):
-                self.takeoff_z = self.current_z
                 req = CommandTOL.Request()
-                req.altitude = self.target_alt
+                req.altitude = float(self.target_alt)
                 future = self.takeoff_cli.call_async(req)
                 future.add_done_callback(self.takeoff_response_cb)
                 self.step = 3
 
         elif self.step == 3:
-            relative_alt = self.current_z - self.takeoff_z
-            if relative_alt >= self.target_alt * 0.90:
-                if not self.pose_received:
-                    if self.throttle_ready(1.0):
-                        self.get_logger().warn(
-                            'Altitude reached, waiting for /mavros/local_position/pose...'
-                        )
-                    return
+            if self.throttle_ready(1.0):
+                self.get_logger().info(f'Climbing... Relative Alt: {self.relative_alt:.2f}m')
 
-                self.home_x = self.current_pose.pose.position.x
-                self.home_y = self.current_pose.pose.position.y
-                fly_z = self.takeoff_z + self.target_alt
-                self.waypoints = [
-                    (self.home_x + self.side_length, self.home_y, fly_z),
-                    (self.home_x + self.side_length, self.home_y + self.side_length, fly_z),
-                    (self.home_x, self.home_y + self.side_length, fly_z),
-                    (self.home_x, self.home_y, fly_z)
-                ]
-                self.get_logger().info('Takeoff altitude reached. Starting square trajectory...')
+            if self.relative_alt >= self.target_alt * 0.90:
+                self.get_logger().info('Target altitude reached. Hovering for 5 seconds...')
+                self.hover_ticks = 0
                 self.step = 4
 
         elif self.step == 4:
-            if self.wp_index < len(self.waypoints):
-                tx, ty, tz = self.waypoints[self.wp_index]
-                self.publish_waypoint(tx, ty, tz)
-                dist = self.distance_to_target(tx, ty, tz)
+            self.hover_ticks += 1
+            if self.hover_ticks % 10 == 0:
+                self.get_logger().info(f'Hovering... ({self.hover_ticks // 10}/5s)')
 
-                if dist <= self.acceptance_radius:
-                    self.hold_ticks += 1
-                    if self.hold_ticks >= 20:
-                        self.get_logger().info(
-                            f'Waypoint {self.wp_index + 1} reached: ({tx:.2f}, {ty:.2f}, {tz:.2f})'
-                        )
-                        self.wp_index += 1
-                        self.hold_ticks = 0
-                else:
-                    self.hold_ticks = 0
-            else:
-                self.get_logger().info('Square trajectory complete. Switching to LAND...')
+            if self.hover_ticks >= 50:
                 self.step = 5
 
         elif self.step == 5:
             if self.current_state.mode != 'LAND':
                 if self.mode_cli.service_is_ready() and self.throttle_ready(1.0):
+                    self.get_logger().info('Switching to LAND mode...')
                     req = SetMode.Request()
                     req.custom_mode = 'LAND'
                     self.mode_cli.call_async(req)
@@ -196,10 +144,13 @@ class SquareMission(Node):
 
         elif self.step == 6:
             if not self.current_state.armed:
-                self.get_logger().info('Touchdown and disarm confirmed. Mission complete.')
+                self.get_logger().info('Touchdown and disarm confirmed. Sequence complete.')
                 self.timer.cancel()
 
     def takeoff_response_cb(self, future):
+        if self.step != 3:
+            return 
+            
         try:
             res = future.result()
             if not res.success:
@@ -212,7 +163,7 @@ class SquareMission(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SquareMission()
+    node = TakeoffLand()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
