@@ -144,7 +144,6 @@ class SquareMission(Node):
 
         elif self.step == 3:
             relative_alt = self.current_z - self.takeoff_z
-            self.get_logger().info(f'Climbing... Relative Alt: {relative_alt:.2f}m (Z: {self.current_z:.2f})')
             if relative_alt >= self.target_alt * 0.90:
                 if not self.pose_received:
                     if self.throttle_ready(1.0):
@@ -155,11 +154,12 @@ class SquareMission(Node):
 
                 self.home_x = self.current_pose.pose.position.x
                 self.home_y = self.current_pose.pose.position.y
+                fly_z = self.takeoff_z + self.target_alt
                 self.waypoints = [
-                    (self.home_x + self.side_length, self.home_y, self.target_alt),
-                    (self.home_x + self.side_length, self.home_y + self.side_length, self.target_alt),
-                    (self.home_x, self.home_y + self.side_length, self.target_alt),
-                    (self.home_x, self.home_y, self.target_alt)
+                    (self.home_x + self.side_length, self.home_y, fly_z),
+                    (self.home_x + self.side_length, self.home_y + self.side_length, fly_z),
+                    (self.home_x, self.home_y + self.side_length, fly_z),
+                    (self.home_x, self.home_y, fly_z)
                 ]
                 self.get_logger().info('Takeoff altitude reached. Starting square trajectory...')
                 self.step = 4
