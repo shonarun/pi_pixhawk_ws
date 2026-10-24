@@ -1,3 +1,5 @@
+import os
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
@@ -31,7 +33,7 @@ def generate_launch_description():
         ]
     )
 
-   rf2o_node = Node(
+    rf2o_node = Node(
         package='rf2o_laser_odometry',
         executable='rf2o_laser_odometry_node',
         name='rf2o_laser_odometry',
@@ -47,7 +49,7 @@ def generate_launch_description():
         }]
     )
 
-   slam_toolbox_node = Node(
+    slam_toolbox_node = Node(
         package='slam_toolbox',
         executable='async_slam_toolbox_node',
         name='slam_toolbox',
